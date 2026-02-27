@@ -28,19 +28,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-# 기존 모듈에서 필요한 함수 import
-from media_mix_simulator import (
-    apply_budget_adjustment,
-    calculate_budget_competition_factor,
-    calculate_media_performance,
-    calculate_performance,
-    create_scenario_dataframe,
-    format_number,
-    generate_scenarios,
-    get_media_adjusted_metrics,
-)
-
-# 새로운 모듈에서 import
 from modules import (
     # constants
     BENCHMARKS, INDUSTRY_BASE_METRICS, INDUSTRY_SEASON_WEIGHT,
@@ -53,6 +40,18 @@ from modules import (
     calculate_seasonality,
     estimate_conversion_increase,
     calculate_efficiency_grade,
+    format_number,
+    calculate_budget_competition_factor,
+    apply_adjustments,
+    calculate_performance,
+    get_media_adjusted_metrics,
+    calculate_media_performance,
+    generate_scenarios,
+    create_scenario_dataframe,
+    apply_budget_adjustment,
+    # insights
+    generate_recommendations,
+    generate_ai_insights,
     # validators
     validate_input,
     validate_efficiency,
@@ -79,263 +78,6 @@ st.set_page_config(
 # 프리셋 폴더 생성 (없으면 자동 생성)
 if not os.path.exists('saved_presets'):
     os.makedirs('saved_presets')
-
-# =============================================================================
-# 추천 및 인사이트 함수
-# Note: 이 함수들은 길어서 app.py에 유지합니다.
-# 향후 리팩토링 시 modules/insights.py로 이동 가능
-# =============================================================================
-
-def generate_recommendations(scenarios, budget):
-    """
-    시뮬레이션 결과 기반 스마트 추천 생성 (구체적 수치 포함)
-    
-    Args:
-        scenarios: 시나리오 데이터 (base 시나리오 사용)
-        budget: 총 예산
-    
-    Returns:
-        recommendations: 추천 리스트
-    """
-    recommendations = []
-    
-    # base 시나리오 데이터 사용
-    media_data = scenarios.get('base', [])
-    if not media_data:
-        return recommendations
-    
-    # CPA 순으로 정렬
-    sorted_media = sorted([m for m in media_data if m.get('cpa', 0) > 0], key=lambda x: x.get('cpa', 0))
-    
-    if len(sorted_media) >= 2:
-        # 가장 효율 좋은 매체
-        best_media = sorted_media[0]
-        # 가장 효율 나쁜 매체
-        worst_media = sorted_media[-1]
-        
-        # 핵심 추천: 비효율 매체 → 효율 매체로 예산 이동
-        if worst_media['cpa'] > best_media['cpa'] * 1.5:
-            # 비효율 매체의 10%를 효율 매체로 이동
-            shift_ratio = worst_media.get('budget_ratio', 0) * 0.1
-            shift_budget = budget * (shift_ratio / 100)
-            
-            # 효율 좋은 매체의 전환 데이터 기준 추가 전환 계산
-            best_cvr = best_media.get('cvr', 0) / 100
-            best_cpc = best_media.get('cpc', 0)
-            if best_cpc > 0 and best_cvr > 0:
-                additional_clicks = shift_budget / best_cpc
-                additional_conversions = additional_clicks * best_cvr
-                
-                # CPA 개선 계산
-                current_total_cv = sum(m.get('estimated_conversions_adjusted', 0) for m in media_data)
-                current_avg_cpa = budget / current_total_cv if current_total_cv > 0 else 0
-                new_total_cv = current_total_cv + additional_conversions
-                new_avg_cpa = budget / new_total_cv if new_total_cv > 0 else 0
-                cpa_improvement = current_avg_cpa - new_avg_cpa
-                
-                recommendations.append({
-                    'type': 'info',
-                    'icon': '💡',
-                    'message': f"**{worst_media['name']}** 비중 {worst_media['budget_ratio']:.1f}% → **{worst_media['budget_ratio']-shift_ratio:.1f}%** 감소, "
-                              f"**{best_media['name']}** 비중 {best_media['budget_ratio']:.1f}% → **{best_media['budget_ratio']+shift_ratio:.1f}%** 증가 시\n"
-                              f"📈 전환 **+{additional_conversions:.0f}건**, 평균 CPA **-{cpa_improvement:,.0f}원** 개선 예상"
-                })
-    
-    # 2. 비중이 낮지만 효율 좋은 매체 확대 제안
-    for media in sorted_media[:2]:  # 상위 2개
-        ratio = media.get('budget_ratio', 0)
-        cpa = media.get('cpa', 0)
-        name = media.get('name', '매체')
-        cvr = media.get('cvr', 0) / 100
-        cpc = media.get('cpc', 0)
-        
-        if ratio < 20 and cpa > 0:  # 비중이 20% 미만
-            # 10%p 증가 시 효과
-            increase_ratio = 10
-            increase_budget = budget * (increase_ratio / 100)
-            
-            if cpc > 0 and cvr > 0:
-                add_clicks = increase_budget / cpc
-                add_cv = add_clicks * cvr
-                add_cpa_impact = increase_budget / add_cv if add_cv > 0 else 0
-                
-                recommendations.append({
-                    'type': 'info',
-                    'icon': '🚀',
-                    'message': f"**{name}** (현재 CPA {cpa:,.0f}원) 비중 {ratio:.1f}% → **{ratio+increase_ratio:.1f}%** 증가 시\n"
-                              f"📈 전환 **+{add_cv:.0f}건**, 예상 CPA **{add_cpa_impact:,.0f}원** 유지"
-                })
-    
-    # 3. 고비중 리스크 경고
-    for media in media_data:
-        ratio = media.get('budget_ratio', 0)
-        name = media.get('name', '매체')
-        
-        if ratio > RISK_RATIO_THRESHOLD:
-            recommendations.append({
-                'type': 'warning',
-                'icon': '⚠️',
-                'message': f"**{name}** 의존도({ratio:.1f}%)가 높습니다. 매체 알고리즘 변경이나 정책 변화 시 리스크가 큽니다. "
-                          f"다른 매체로 분산을 권장합니다."
-            })
-    
-    # 4. ROAS 개선 기회
-    low_roas_media = [m for m in media_data if 0 < m.get('roas', 0) < 150]
-    if low_roas_media:
-        for media in low_roas_media:
-            name = media.get('name', '매체')
-            roas = media.get('roas', 0)
-            cpa = media.get('cpa', 0)
-            revenue_per_cv = media.get('revenue_per_conversion', 0)
-            
-            # 목표 ROAS 150% 달성을 위한 필요 매출
-            needed_revenue = cpa * 1.5
-            current_revenue = revenue_per_cv
-            revenue_gap = needed_revenue - current_revenue
-            
-            recommendations.append({
-                'type': 'warning',
-                'icon': '💰',
-                'message': f"**{name}** ROAS {roas:.1f}%로 낮습니다. "
-                          f"전환당 매출을 현재 {current_revenue:,.0f}원에서 **{needed_revenue:,.0f}원**으로 "
-                          f"**(+{revenue_gap:,.0f}원)** 개선 시 ROAS 150% 달성 가능"
-            })
-    
-    # 5. 전체 볼륨 확대 제안
-    total_conversions = sum(m.get('estimated_conversions_adjusted', 0) for m in media_data)
-    if 0 < total_conversions < 200:
-        # 예산 30% 증액 시 효과
-        new_budget = budget * 1.3
-        estimated_new_cv = total_conversions * 1.3
-        
-        recommendations.append({
-            'type': 'info',
-            'icon': '📈',
-            'message': f"현재 예상 전환수({total_conversions:.0f}건)가 부족합니다. "
-                      f"총 예산을 {format_number(int(budget))}원 → **{format_number(int(new_budget))}원** "
-                      f"**(+30%, +{format_number(int(new_budget - budget))}원)** 증액 시 "
-                      f"전환 **{estimated_new_cv:.0f}건** 달성 예상"
-        })
-    
-    return recommendations
-
-def generate_ai_insights(result_data, industry, month, goal):
-    """
-    시뮬레이션 결과 기반 고급 AI 인사이트 생성
-    
-    Args:
-        result_data: 시뮬레이션 결과 데이터
-        industry: 업종
-        month: 운영 월
-        goal: 캠페인 목표
-    
-    Returns:
-        insights: 인사이트 리스트
-    """
-    insights = []
-    
-    # 결과 데이터 구조에 따라 접근
-    scenarios = result_data.get('scenarios', {})
-    media_data = scenarios.get('base', []) if scenarios else result_data.get('media_list', [])
-    
-    # 총 전환수 계산
-    total_conversions = sum(m.get('estimated_conversions_adjusted', m.get('conversions', 0)) for m in media_data)
-    
-    # 평균 CPA 계산
-    total_budget = result_data.get('budget', 0)
-    avg_cpa = (total_budget / total_conversions) if total_conversions > 0 else 0
-    
-    # 평균 ROAS 계산
-    total_revenue = sum(m.get('total_revenue_adjusted', m.get('revenue', 0)) for m in media_data)
-    avg_roas = (total_revenue / total_budget * 100) if total_budget > 0 else 0
-    
-    # 1. 성과 수준 평가
-    if total_conversions >= 1000:
-        insights.append({
-            'type': 'success',
-            'title': '🎯 우수한 전환 성과',
-            'message': f'예상 전환수({total_conversions:,.0f}건)가 매우 높습니다. 안정적인 캠페인 운영이 가능합니다.'
-        })
-    elif total_conversions < 100:
-        insights.append({
-            'type': 'warning',
-            'title': '⚠️ 전환 볼륨 부족',
-            'message': f'예상 전환수({total_conversions:,.0f}건)가 적어 통계적 유의성이 낮을 수 있습니다. 예산 증액 또는 목표 조정을 권장합니다.'
-        })
-    
-    # 2. 업종별 벤치마크 비교
-    industry_avg_cpa = {
-        '보험': 60000,
-        '금융': 50000,
-        '패션': 35000,
-        'IT/테크': 45000
-    }.get(industry, 50000)
-    
-    if avg_cpa > 0:
-        if avg_cpa < industry_avg_cpa * 0.8:
-            insights.append({
-                'type': 'success',
-                'title': '💰 효율적인 CPA',
-                'message': f'평균 CPA({avg_cpa:,.0f}원)가 {industry} 업종 평균({industry_avg_cpa:,}원)보다 {((industry_avg_cpa - avg_cpa) / industry_avg_cpa * 100):.0f}% 낮습니다.'
-            })
-        elif avg_cpa > industry_avg_cpa * 1.3:
-            insights.append({
-                'type': 'error',
-                'title': '📈 높은 CPA',
-                'message': f'평균 CPA({avg_cpa:,.0f}원)가 {industry} 업종 평균({industry_avg_cpa:,}원)보다 높습니다. 타겟팅 또는 크리에이티브 개선이 필요합니다.'
-            })
-    
-    # 3. 매체 다각화 분석
-    sa_ratio = sum(m.get('budget_ratio', 0) for m in media_data if '검색' in m.get('category', ''))
-    da_ratio = sum(m.get('budget_ratio', 0) for m in media_data if '디스플레이' in m.get('category', ''))
-    
-    if abs(sa_ratio - da_ratio) > RISK_RATIO_THRESHOLD:
-        dominant = "검색광고" if sa_ratio > da_ratio else "디스플레이광고"
-        insights.append({
-            'type': 'info',
-            'title': '🎯 매체 편중',
-            'message': f'{dominant} 비중이 높습니다. 균형잡힌 믹스를 위해 다른 매체 확대를 검토하세요.'
-        })
-    
-    # 4. 계절성 활용
-    season_factor = SEASONALITY_COMMON.get(month, 1.0)
-    if season_factor >= 1.15:
-        insights.append({
-            'type': 'success',
-            'title': '🔥 최적의 시기',
-            'message': f'{month}월은 {industry} 업종의 성수기입니다. 공격적인 집행을 권장합니다.'
-        })
-    elif season_factor <= 0.85:
-        insights.append({
-            'type': 'warning',
-            'title': '❄️ 비수기 대응',
-            'message': f'{month}월은 효율이 낮은 시기입니다. 브랜딩 중심 또는 예산 축소를 고려하세요.'
-        })
-    
-    # 5. 목표 일치도
-    if goal and "전환" in str(goal) and sa_ratio < 60:
-        insights.append({
-            'type': 'info',
-            'title': '🎯 목표-믹스 불일치',
-            'message': '전환 중심 목표인데 검색광고 비중이 낮습니다. SA 비중을 60% 이상으로 증가시키면 더 좋은 성과를 기대할 수 있습니다.'
-        })
-    
-    # 6. ROAS 평가
-    if avg_roas > 0:
-        if avg_roas >= 200:
-            insights.append({
-                'type': 'success',
-                'title': '💰 높은 수익성',
-                'message': f'평균 ROAS({avg_roas:.1f}%)가 우수합니다. 예산 증액을 고려해보세요.'
-            })
-        elif avg_roas < 100:
-            insights.append({
-                'type': 'error',
-                'title': '⚠️ 낮은 수익성',
-                'message': f'평균 ROAS({avg_roas:.1f}%)가 100% 미만입니다. 전환당 매출 증가 또는 CPA 개선이 필요합니다.'
-            })
-    
-    return insights
 
 # 세션 스테이트 초기화
 if 'results' not in st.session_state:
@@ -399,10 +141,14 @@ st.sidebar.info("💡 **Tip**: 자동 생성 모드로 빠르게 시작하세요
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📁 프리셋 관리")
 
+@st.cache_data(ttl=30)
+def _get_preset_files():
+    if not os.path.exists('saved_presets'):
+        return []
+    return [f.replace('.json', '') for f in os.listdir('saved_presets') if f.endswith('.json')]
+
 # 저장된 프리셋 목록
-preset_files = []
-if os.path.exists('saved_presets'):
-    preset_files = [f.replace('.json', '') for f in os.listdir('saved_presets') if f.endswith('.json')]
+preset_files = _get_preset_files()
 
 if preset_files:
     selected_preset = st.sidebar.selectbox(
@@ -459,6 +205,7 @@ if preset_files:
             if selected_preset != "선택하세요...":
                 try:
                     os.remove(f'saved_presets/{selected_preset}.json')
+                    _get_preset_files.clear()
                     st.success(f"✅ '{selected_preset}' 프리셋 삭제 완료!")
                     st.rerun()
                 except Exception as e:
@@ -488,8 +235,8 @@ st.sidebar.markdown("""
 """, unsafe_allow_html=True)
 
 # 버전 정보 (실시간 날짜 반영)
-current_date = datetime.now().strftime("%Y.%m.%d")
-st.sidebar.caption(f"v2.5.0 | {current_date}")
+_today_str = datetime.now().strftime("%Y.%m.%d")
+st.sidebar.caption(f"v2.5.0 | {_today_str}")
 
 
 # ===== 홈 화면 =====
@@ -613,9 +360,8 @@ if mode == "🏠 홈":
     
     # 버전 정보 및 업데이트 내역
     with st.expander("📋 버전 정보 및 업데이트 내역"):
-        current_version_date = datetime.now().strftime("%Y.%m.%d")
         st.markdown(f"""
-        **v2.5** ({current_version_date})
+        **v2.5** ({_today_str})
         - 🆕 라이트모드 UI 적용 (흰색 배경, 파란색 강조)
         - 🆕 핵심 지표 카드 4개 추가 (전환수/CPA/ROAS/효율등급)
         - 🆕 매체 효율 순위 시스템 (Best 3 / Worst 3)
@@ -1474,7 +1220,7 @@ elif mode == "📊 자동 생성":
                     
                     with open(f'saved_presets/{preset_name}.json', 'w', encoding='utf-8') as f:
                         json.dump(preset_data, f, ensure_ascii=False, indent=2)
-                    
+                    _get_preset_files.clear()
                     st.success(f"✅ '{preset_name}' 프리셋 저장 완료!")
                     # 프리셋 불러온 것 초기화
                     if 'preset_budget' in st.session_state:
@@ -1818,7 +1564,7 @@ elif mode == "✏️ 수동 입력":
                     
                     with open(f'saved_presets/{preset_name_manual}.json', 'w', encoding='utf-8') as f:
                         json.dump(preset_data, f, ensure_ascii=False, indent=2)
-                    
+                    _get_preset_files.clear()
                     st.success(f"✅ '{preset_name_manual}' 프리셋 저장 완료!")
                     # 프리셋 불러온 것 초기화
                     if 'preset_budget' in st.session_state:
